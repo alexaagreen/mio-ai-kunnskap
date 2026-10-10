@@ -1,0 +1,17 @@
+node_modules
+.next
+out
+.env
+.env.local
+.env.*.local
+*.tsbuildinfo
+next-env.d.ts
+.DS_Store
+
+# Raw Salesforce exports, PDF printouts and generated canonical data stay out of git (internal Mio content).
+data/pdf/*
+!data/pdf/.gitkeep
+data/raw/*
+!data/raw/.gitkeep
+data/canonical/*
+!data/canonical/.gitkeep

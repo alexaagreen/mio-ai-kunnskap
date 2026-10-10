@@ -1,0 +1,37 @@
+{
+  "name": "mio-kb",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "typecheck": "tsc --noEmit",
+    "db:migrate": "tsx scripts/migrate.ts",
+    "kb:normalize": "tsx scripts/normalize.ts",
+    "kb:ingest": "tsx scripts/ingest.ts",
+    "kb:fetch-salesforce": "tsx scripts/fetch-salesforce.ts"
+  },
+  "dependencies": {
+    "@anthropic-ai/foundry-sdk": "^0.5.4",
+    "@anthropic-ai/sdk": "^0.133.0",
+    "csv-parse": "^6.1.0",
+    "next": "^16.4.0",
+    "openai": "^7.32.0",
+    "pg": "^8.23.1",
+    "react": "^19.3.0",
+    "react-dom": "^19.3.0",
+    "turndown": "^7.2.4",
+    "zod": "^4.6.5"
+  },
+  "devDependencies": {
+    "@types/node": "^24",
+    "@types/pg": "^8",
+    "@types/react": "^19",
+    "@types/react-dom": "^19",
+    "@types/turndown": "^5",
+    "dotenv": "^17",
+    "tsx": "^4.23.15",
+    "typescript": "^5"
+  }
+}
