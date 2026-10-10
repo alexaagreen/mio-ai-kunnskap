@@ -78,11 +78,14 @@ export class AnthropicLlm implements LlmClient {
   async classify<T extends z.ZodType>(params: ClassifyParams<T>): Promise<{ value: z.infer<T>; usage: Usage }> {
     const res = await this.client.messages.parse({
       model: params.model,
-      max_tokens: params.maxTokens ?? 200,
+      // Thinking tokens count against max_tokens on 5.5 models, so leave real headroom for the JSON.
+      max_tokens: params.maxTokens ?? 2048,
       system: [{ type: "text", text: params.system, cache_control: { type: "ephemeral" } }],
       messages: [{ role: "user", content: params.user }],
+      thinking: { type: "adaptive", display: "omitted" },
       output_config: { effort: "low", format: zodOutputFormat(params.schema) },
     });
+    if (res.stop_reason === "max_tokens") throw new Error(`Classifier hit max_tokens (${params.maxTokens ?? 2048}); raise maxTokens`);
     const value = res.parsed_output as z.infer<T>;
     if (value === null || value === undefined) throw new Error("Classifier returned no parsable output");
     return {

@@ -38,6 +38,7 @@ export interface ClassifyParams<T extends z.ZodType> {
   system: string;
   user: string;
   schema: T;
+  /** Includes thinking tokens on 5.5 models — keep generous (default 2048). */
   maxTokens?: number;
 }
 

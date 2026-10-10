@@ -32,7 +32,7 @@ export const config = {
     answerModel: process.env.ANSWER_MODEL ?? "claude-opus-5-5",
     classifierModel: process.env.CLASSIFIER_MODEL ?? "claude-haiku-5-5",
     answerEffort: (process.env.ANSWER_EFFORT ?? "low") as "low" | "medium" | "high",
-    answerMaxTokens: envInt("ANSWER_MAX_TOKENS", 1000),
+    answerMaxTokens: envInt("ANSWER_MAX_TOKENS", 4000), // includes adaptive-thinking tokens on 5.5 models
   },
 
   embeddings: {

@@ -83,7 +83,15 @@ export async function retrieveArticles(question: string, topArticles = config.ga
     catalogue.length <= config.gates.routerCatalogueMax
       ? catalogue
       : catalogue.filter((c) => keywordIds.includes(c.id)); // large KB: only keyword candidates
-  const router = await routeQuestion(question, menu, keywordIds.slice(0, 5), topArticles);
+  let router: Awaited<ReturnType<typeof routeQuestion>>;
+  try {
+    router = await routeQuestion(question, menu, keywordIds.slice(0, 5), topArticles);
+  } catch (err) {
+    // Router hiccup (truncated JSON, transient API error): fall back to keyword candidates and let gate 3 judge scope.
+    console.error("router failed, falling back to keyword search", err);
+    const ranked: Array<[string, { fused: number; score: number }]> = keywordIds.slice(0, topArticles).map((id, i) => [id, { fused: 1 / (i + 1), score: 1 }]);
+    return { articles: await hydrate(ranked) };
+  }
 
   const ranked: Array<[string, { fused: number; score: number }]> = router.articleIds.map((id, i) => [id, { fused: 1 / (i + 1), score: 1 }]);
   return { articles: await hydrate(ranked), router: { verdict: router.verdict, clarifyingQuestion: router.clarifyingQuestion, usage: router.usage } };
@@ -122,7 +130,7 @@ async function routeQuestion(question: string, menu: CatalogueEntry[], keywordHi
     system: routerSystemPrompt(menu), // cached: the catalogue only changes when the KB is rebuilt
     user: `Spørsmål: ${question}${hint}`,
     schema: RouteSchema,
-    maxTokens: 300,
+    maxTokens: 2048,
   });
   const articleIds = [...new Set(value.article_ids)].filter((id) => valid.has(id)).slice(0, max);
   return { verdict: value.verdict, clarifyingQuestion: value.clarifying_question, articleIds, usage };

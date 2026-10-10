@@ -90,7 +90,7 @@ Ved live (4 000 artikler, `STORE=postgres`) byttes til `azure-openai`-embeddings
 | 1 | Min/maks lengde, normalisering, eksakt-gjentak-cache (`answer_cache`) | Gratis |
 | 2 | Ingen artikkel funnet (ruter valgte ingen / beste cosine-score < `RETRIEVAL_MIN_SCORE`) → avvis | Ruter-kall / ett embedding-kall |
 | 3 | Haiku 5.5-klassifisering: `in_scope` / `out_of_scope` / `clarify`, med kategoritreet som scope-definisjon (inkludert i ruter-kallet når embeddings er av) | ~300 cachede tokens |
-| 4 | Streng, cachet systemprompt («svar kun fra vedlagte artikler, oppgi kilder»), `ANSWER_MAX_TOKENS`, kun siste `HISTORY_MAX_MESSAGES` meldinger | Det eneste dyre kallet |
+| 4 | Streng, cachet systemprompt («svar kun fra vedlagte artikler, oppgi kilder»), `ANSWER_MAX_TOKENS` (dekker også skjult tenking på 5.5-modellene – hold den romslig), kun siste `HISTORY_MAX_MESSAGES` meldinger | Det eneste dyre kallet |
 
 Alle avgjørelser logges i `query_log` med spørsmål, gate, beste score, artikkel-ID-er og tokenbruk. Bruk den til å justere `RETRIEVAL_MIN_SCORE` og til å finne hull i kunnskapsbasen (`WHERE gate = 'gate2_no_match'`).
 

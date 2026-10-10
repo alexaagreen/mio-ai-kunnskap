@@ -105,7 +105,7 @@ export async function gate3(question: string, articles: RetrievedArticle[], cate
     system: classifierSystemPrompt(categories),
     user,
     schema: ClassificationSchema,
-    maxTokens: 150,
+    maxTokens: 1024,
   });
   return { outcome: verdictToOutcome(value.verdict, value.clarifying_question), usage };
 }
