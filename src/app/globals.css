@@ -114,15 +114,80 @@ body {
   border-radius: 14px;
   background: var(--surface);
   border: 1px solid var(--border);
-  white-space: pre-wrap;
   word-wrap: break-word;
 }
 .bubble.user {
   align-self: flex-end;
   background: var(--user);
+  white-space: pre-wrap;
 }
 .bubble.assistant {
   align-self: flex-start;
+}
+
+/* Markdown inside assistant bubbles */
+.bubble.assistant .content > :first-child {
+  margin-top: 0;
+}
+.bubble.assistant .content > :last-child {
+  margin-bottom: 0;
+}
+.bubble.assistant p {
+  margin: 0 0 10px;
+}
+.bubble.assistant ul,
+.bubble.assistant ol {
+  margin: 0 0 10px;
+  padding-left: 22px;
+}
+.bubble.assistant li {
+  margin: 2px 0;
+}
+.bubble.assistant h1,
+.bubble.assistant h2,
+.bubble.assistant h3,
+.bubble.assistant h4 {
+  font-size: 15px;
+  margin: 12px 0 6px;
+}
+.bubble.assistant code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 13px;
+  background: var(--bg);
+  padding: 1px 5px;
+  border-radius: 4px;
+}
+.bubble.assistant pre {
+  background: var(--bg);
+  padding: 10px 12px;
+  border-radius: 8px;
+  overflow-x: auto;
+}
+.bubble.assistant table {
+  border-collapse: collapse;
+  margin: 6px 0 10px;
+  font-size: 14px;
+  display: block;
+  overflow-x: auto;
+}
+.bubble.assistant th,
+.bubble.assistant td {
+  border: 1px solid var(--border);
+  padding: 5px 9px;
+  text-align: left;
+  vertical-align: top;
+}
+.bubble.assistant th {
+  background: var(--bg);
+}
+.bubble.assistant blockquote {
+  margin: 0 0 10px;
+  padding-left: 12px;
+  border-left: 3px solid var(--border);
+  color: var(--muted);
+}
+.bubble.assistant a {
+  color: var(--accent);
 }
 
 .badge {

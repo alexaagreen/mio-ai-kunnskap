@@ -1,6 +1,8 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 
 type Role = "user" | "assistant";
 
@@ -126,7 +128,17 @@ export function Chat() {
         {messages.map((m) => (
           <article key={m.id} className={`bubble ${m.role}`}>
             {m.gate && m.gate !== "answered" && <span className={`badge ${m.gate === "error" ? "bad" : ""}`}>{GATE_LABEL[m.gate] ?? m.gate}</span>}
-            <div className="content">{m.content || (m.streaming ? <span className="dots">Tenker…</span> : null)}</div>
+            <div className="content">
+              {m.content ? (
+                m.role === "assistant" ? (
+                  <ReactMarkdown remarkPlugins={[remarkGfm]}>{m.content}</ReactMarkdown>
+                ) : (
+                  m.content
+                )
+              ) : m.streaming ? (
+                <span className="dots">Tenker…</span>
+              ) : null}
+            </div>
             {m.sources && m.sources.length > 0 && m.gate === "answered" && (
               <div className="sources">
                 {m.sources.map((s) =>
