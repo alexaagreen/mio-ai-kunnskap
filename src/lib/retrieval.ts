@@ -1,112 +1,134 @@
+import { z } from "zod";
 import { config } from "./config";
-import { getPool, toVectorLiteral } from "./db";
-import { getEmbeddingClient } from "./embeddings";
+import { embeddingsEnabled, getEmbeddingClient } from "./embeddings";
+import { getLlm, type Usage } from "./llm";
+import { getStore, type CatalogueEntry, type ChunkHit, type StoredArticle } from "./store";
 
-export interface RetrievedArticle {
-  id: string;
-  articleNumber: string | null;
-  title: string;
-  summary: string | null;
-  bodyMd: string;
-  categories: string[];
-  sourceUrl: string | null;
-  /** Best cosine similarity among this article's chunks (0..1). Used by gate 2. */
+export interface RetrievedArticle extends StoredArticle {
+  /** Best cosine similarity among this article's chunks (0..1); 1 when picked by the router. Used by gate 2. */
   score: number;
-  /** Fused rank score (vector + keyword, RRF). Used for ordering. */
+  /** Fused rank score. Used for ordering. */
   fused: number;
 }
 
-interface ChunkHit {
-  article_id: string;
-  chunk_index: number;
-  score: number; // cosine similarity
+export interface RouterResult {
+  verdict: "in_scope" | "out_of_scope" | "clarify";
+  clarifyingQuestion: string | null;
+  usage: Usage;
 }
 
-/**
- * Hybrid retrieval: pgvector cosine search + Postgres full-text (Norwegian) search, fused with
- * reciprocal rank fusion, then grouped by article. Returns the top N whole articles.
- *
- * The same SQL runs on Azure Database for PostgreSQL. If Mio prefers Azure AI Search later,
- * this is the only module to replace.
- */
-export async function retrieveArticles(question: string, topArticles = config.gates.answerTopArticles): Promise<RetrievedArticle[]> {
-  const [embedding] = await getEmbeddingClient().embed([question]);
-  const pool = getPool();
-  const k = 20;
+export interface RetrievalResult {
+  articles: RetrievedArticle[];
+  /** Present when EMBEDDING_PROVIDER=none: the router already judged scope, so gate 3 is skipped. */
+  router?: RouterResult;
+}
 
-  const vectorRes = await pool.query<ChunkHit>(
-    `SELECT article_id, chunk_index, 1 - (embedding <=> $1::vector) AS score
-       FROM chunks
-      ORDER BY embedding <=> $1::vector
-      LIMIT $2`,
-    [toVectorLiteral(embedding), k],
-  );
+const k = 20;
+const rrfK = 60;
 
-  const keywordRes = await pool.query<ChunkHit>(
-    `SELECT article_id, chunk_index, ts_rank_cd(tsv, q) AS score
-       FROM chunks, websearch_to_tsquery('norwegian', $1) q
-      WHERE tsv @@ q
-      ORDER BY score DESC
-      LIMIT $2`,
-    [question, k],
-  );
-
-  // Reciprocal rank fusion per article (best rank per list), keep best cosine for the gate.
-  const rrfK = 60;
+function fuse(lists: Array<{ hits: ChunkHit[]; weight: number; isVector: boolean }>): Map<string, { fused: number; score: number }> {
   const fused = new Map<string, { fused: number; score: number }>();
-  const bump = (hits: ChunkHit[], weight: number, isVector: boolean) => {
+  for (const { hits, weight, isVector } of lists) {
     const seen = new Set<string>();
     hits.forEach((h, rank) => {
-      if (seen.has(h.article_id)) return;
-      seen.add(h.article_id);
-      const cur = fused.get(h.article_id) ?? { fused: 0, score: 0 };
+      if (seen.has(h.articleId)) return;
+      seen.add(h.articleId);
+      const cur = fused.get(h.articleId) ?? { fused: 0, score: 0 };
       cur.fused += weight / (rrfK + rank + 1);
-      if (isVector) cur.score = Math.max(cur.score, Number(h.score));
-      fused.set(h.article_id, cur);
+      if (isVector) cur.score = Math.max(cur.score, h.score);
+      fused.set(h.articleId, cur);
     });
-  };
-  bump(vectorRes.rows, 1.0, true);
-  bump(keywordRes.rows, 0.7, false);
+  }
+  return fused;
+}
 
-  const ranked = [...fused.entries()].sort((a, b) => b[1].fused - a[1].fused).slice(0, topArticles);
+async function hydrate(ranked: Array<[string, { fused: number; score: number }]>): Promise<RetrievedArticle[]> {
   if (!ranked.length) return [];
-
-  const ids = ranked.map(([id]) => id);
-  const articles = await pool.query<{
-    id: string;
-    article_number: string | null;
-    title: string;
-    summary: string | null;
-    body_md: string;
-    categories: string[];
-    source_url: string | null;
-  }>(`SELECT id, article_number, title, summary, body_md, categories, source_url FROM articles WHERE id = ANY($1)`, [ids]);
-
-  const byId = new Map(articles.rows.map((a) => [a.id, a]));
+  const articles = await (await getStore()).getArticles(ranked.map(([id]) => id));
+  const byId = new Map(articles.map((a) => [a.id, a]));
   return ranked
     .map(([id, s]) => {
       const a = byId.get(id);
-      if (!a) return null;
-      return {
-        id: a.id,
-        articleNumber: a.article_number,
-        title: a.title,
-        summary: a.summary,
-        bodyMd: a.body_md,
-        categories: a.categories,
-        sourceUrl: a.source_url,
-        score: s.score,
-        fused: s.fused,
-      } satisfies RetrievedArticle;
+      return a ? ({ ...a, score: s.score, fused: s.fused } satisfies RetrievedArticle) : null;
     })
     .filter((a): a is RetrievedArticle => a !== null);
 }
 
-/** Distinct category paths in the KB — used in the classifier and answering system prompts. Cached per process. */
-let categoryCache: { at: number; value: string[] } | undefined;
+/**
+ * Retrieval, two flavours:
+ *  - embeddings on  : vector search + keyword search, reciprocal rank fusion, top N whole articles.
+ *  - embeddings off : keyword search for candidates + a Haiku "router" that reads the article catalogue
+ *                     (titles, summaries, categories) and picks the relevant articles — and judges scope
+ *                     at the same time, so gate 3 is folded into this call. Anthropic key only.
+ */
+export async function retrieveArticles(question: string, topArticles = config.gates.answerTopArticles): Promise<RetrievalResult> {
+  const store = await getStore();
+
+  if (embeddingsEnabled()) {
+    const [embedding] = await getEmbeddingClient().embed([question]);
+    const [vectorHits, keywordHits] = await Promise.all([store.vectorSearch(embedding, k), store.keywordSearch(question, k)]);
+    const fused = fuse([
+      { hits: vectorHits, weight: 1.0, isVector: true },
+      { hits: keywordHits, weight: 0.7, isVector: false },
+    ]);
+    const ranked = [...fused.entries()].sort((a, b) => b[1].fused - a[1].fused).slice(0, topArticles);
+    return { articles: await hydrate(ranked) };
+  }
+
+  // --- no embeddings: keyword candidates + router ---
+  const keywordHits = await store.keywordSearch(question, k);
+  const keywordIds = [...new Set(keywordHits.map((h) => h.articleId))];
+  const catalogue = await store.listCatalogue();
+  const menu =
+    catalogue.length <= config.gates.routerCatalogueMax
+      ? catalogue
+      : catalogue.filter((c) => keywordIds.includes(c.id)); // large KB: only keyword candidates
+  const router = await routeQuestion(question, menu, keywordIds.slice(0, 5), topArticles);
+
+  const ranked: Array<[string, { fused: number; score: number }]> = router.articleIds.map((id, i) => [id, { fused: 1 / (i + 1), score: 1 }]);
+  return { articles: await hydrate(ranked), router: { verdict: router.verdict, clarifyingQuestion: router.clarifyingQuestion, usage: router.usage } };
+}
+
+const RouteSchema = z.object({
+  verdict: z.enum(["in_scope", "out_of_scope", "clarify"]),
+  article_ids: z.array(z.string()).describe("IDs of the articles that most likely contain the answer, best first. Empty if none."),
+  clarifying_question: z.string().nullable().describe("Only when verdict is clarify: one short question in Norwegian."),
+});
+
+export function routerSystemPrompt(menu: CatalogueEntry[]): string {
+  const lines = menu.map((c) => {
+    const cats = c.categories.length ? ` [${c.categories.join("; ")}]` : "";
+    const sum = c.summary ? ` — ${c.summary.slice(0, 200)}` : "";
+    return `- id=${c.id}: ${c.title}${cats}${sum}`;
+  });
+  return [
+    "Du er ruter foran en intern kunnskapsbase for administrasjonen i Mio. Du får et spørsmål og katalogen over artikler.",
+    "Oppgave: velg de artiklene (maks 4) som mest sannsynlig inneholder svaret, og avgjør om spørsmålet er innenfor det kunnskapsbasen dekker.",
+    "- in_scope: spørsmålet handler om rutiner, regler, systemer eller fakta som sannsynligvis er dokumentert i en av artiklene. Returner article_ids.",
+    "- out_of_scope: småprat, generelle spørsmål, koding, oversettelse, kreativ skriving, eller tema ingen artikkel dekker. Returner tom article_ids.",
+    "- clarify: relevant, men for vagt til å velge artikkel (mangler f.eks. hvilket selskap eller hvilken situasjon). Gi ett kort oppklaringsspørsmål.",
+    "Bruk kun id-ene fra katalogen. Svar kun med JSON.",
+    "",
+    "Katalog:",
+    ...lines,
+  ].join("\n");
+}
+
+async function routeQuestion(question: string, menu: CatalogueEntry[], keywordHint: string[], max: number) {
+  const valid = new Set(menu.map((c) => c.id));
+  const hint = keywordHint.length ? `\n\nNøkkelordsøk traff disse id-ene (kan være relevante, men ikke nødvendigvis): ${keywordHint.join(", ")}` : "";
+  const { value, usage } = await getLlm().classify({
+    model: config.llm.classifierModel,
+    system: routerSystemPrompt(menu), // cached: the catalogue only changes when the KB is rebuilt
+    user: `Spørsmål: ${question}${hint}`,
+    schema: RouteSchema,
+    maxTokens: 300,
+  });
+  const articleIds = [...new Set(value.article_ids)].filter((id) => valid.has(id)).slice(0, max);
+  return { verdict: value.verdict, clarifyingQuestion: value.clarifying_question, articleIds, usage };
+}
+
+/** Distinct category paths in the KB — used in the classifier and answering system prompts. */
 export async function listCategories(): Promise<string[]> {
-  if (categoryCache && Date.now() - categoryCache.at < 10 * 60 * 1000) return categoryCache.value;
-  const res = await getPool().query<{ c: string }>(`SELECT DISTINCT unnest(categories) AS c FROM articles ORDER BY c`);
-  categoryCache = { at: Date.now(), value: res.rows.map((r) => r.c) };
-  return categoryCache.value;
+  return (await getStore()).listCategories();
 }

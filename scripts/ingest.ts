@@ -3,7 +3,7 @@ import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { chunkArticle } from "../src/lib/chunk";
 import { getPool, toVectorLiteral } from "../src/lib/db";
-import { getEmbeddingClient } from "../src/lib/embeddings";
+import { embeddingsEnabled, getEmbeddingClient } from "../src/lib/embeddings";
 import { ArticleSchema, type Article } from "../src/lib/schema";
 
 /**
@@ -30,6 +30,7 @@ async function main() {
     .map((line) => ArticleSchema.parse(JSON.parse(line)));
   console.log(`Loaded ${articles.length} articles from ${file}`);
 
+  if (!embeddingsEnabled()) throw new Error("STORE=postgres needs embeddings (pgvector). Set EMBEDDING_PROVIDER=openai or azure-openai.");
   const pool = getPool();
   const embedder = getEmbeddingClient();
 

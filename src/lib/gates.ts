@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { z } from "zod";
 import { config } from "./config";
-import { getPool } from "./db";
+import { getStore } from "./store";
 import { getLlm } from "./llm";
 import type { Usage } from "./llm";
 import type { RetrievedArticle } from "./retrieval";
@@ -11,6 +11,7 @@ import type { RetrievedArticle } from "./retrieval";
  *   gate 1  deterministic (length, normalisation, exact-repeat cache)  — free
  *   gate 2  retrieval score threshold                                  — one embedding call
  *   gate 3  Haiku classifier (in_scope / out_of_scope / clarify)       — ~300 cached tokens
+ *           (with EMBEDDING_PROVIDER=none the router in retrieval.ts gives this verdict, so gate 3 is skipped)
  *   gate 4  strict answering prompt + max_tokens                       — the only expensive call
  * Gate 0 (login + rate limiting) is intentionally skipped in the prototype.
  */
@@ -46,22 +47,11 @@ export function gate1(question: string): GateOutcome {
 }
 
 export async function cacheLookup(question: string): Promise<{ answer: string; articleIds: string[] } | null> {
-  const hash = questionHash(question);
-  const res = await getPool().query<{ answer: string; article_ids: string[] }>(
-    `UPDATE answer_cache SET hits = hits + 1 WHERE question_hash = $1 RETURNING answer, article_ids`,
-    [hash],
-  );
-  const row = res.rows[0];
-  return row ? { answer: row.answer, articleIds: row.article_ids } : null;
+  return (await getStore()).cacheGet(questionHash(question));
 }
 
 export async function cacheStore(question: string, answer: string, articleIds: string[]): Promise<void> {
-  await getPool().query(
-    `INSERT INTO answer_cache (question_hash, question, answer, article_ids)
-     VALUES ($1, $2, $3, $4)
-     ON CONFLICT (question_hash) DO NOTHING`,
-    [questionHash(question), normalizeQuestion(question), answer, articleIds],
-  );
+  await (await getStore()).cacheSet(questionHash(question), normalizeQuestion(question), { answer, articleIds });
 }
 
 // ---------- Gate 2 ----------
@@ -95,6 +85,13 @@ export function classifierSystemPrompt(categories: string[]): string {
   ].join("\n");
 }
 
+/** Turns a classifier/router verdict into a gate outcome. */
+export function verdictToOutcome(verdict: "in_scope" | "out_of_scope" | "clarify", clarifyingQuestion: string | null | undefined): GateOutcome {
+  if (verdict === "out_of_scope") return { kind: "reject", gate: "gate3_out_of_scope", message: MESSAGES.outOfScope };
+  if (verdict === "clarify") return { kind: "clarify", gate: "gate3_clarify", message: clarifyingQuestion?.trim() || MESSAGES.tooShort };
+  return { kind: "pass" };
+}
+
 export async function gate3(question: string, articles: RetrievedArticle[], categories: string[]): Promise<{ outcome: GateOutcome; usage: Usage }> {
   const user = [
     `Spørsmål: ${normalizeQuestion(question)}`,
@@ -110,10 +107,5 @@ export async function gate3(question: string, articles: RetrievedArticle[], cate
     schema: ClassificationSchema,
     maxTokens: 150,
   });
-
-  if (value.verdict === "out_of_scope") return { outcome: { kind: "reject", gate: "gate3_out_of_scope", message: MESSAGES.outOfScope }, usage };
-  if (value.verdict === "clarify") {
-    return { outcome: { kind: "clarify", gate: "gate3_clarify", message: value.clarifying_question?.trim() || MESSAGES.tooShort }, usage };
-  }
-  return { outcome: { kind: "pass" }, usage };
+  return { outcome: verdictToOutcome(value.verdict, value.clarifying_question), usage };
 }

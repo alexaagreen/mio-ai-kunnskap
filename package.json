@@ -7,8 +7,10 @@
     "build": "next build",
     "start": "next start",
     "typecheck": "tsc --noEmit",
-    "db:migrate": "tsx scripts/migrate.ts",
     "kb:normalize": "tsx scripts/normalize.ts",
+    "kb:index": "tsx scripts/index.ts",
+    "kb:build": "tsx scripts/normalize.ts && tsx scripts/index.ts",
+    "db:migrate": "tsx scripts/migrate.ts",
     "kb:ingest": "tsx scripts/ingest.ts",
     "kb:fetch-salesforce": "tsx scripts/fetch-salesforce.ts"
   },

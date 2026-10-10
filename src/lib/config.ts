@@ -18,9 +18,13 @@ function envFloat(name: string, fallback: number): number {
 }
 
 export type LlmProvider = "anthropic" | "foundry" | "azure-openai";
-export type EmbeddingProvider = "openai" | "azure-openai";
+export type EmbeddingProvider = "openai" | "azure-openai" | "none";
+
+export type StoreKind = "file" | "postgres";
 
 export const config = {
+  /** file = data/index/index.json in memory (prototype). postgres = pgvector (live). */
+  store: (process.env.STORE ?? "file") as StoreKind,
   databaseUrl: () => env("DATABASE_URL"),
 
   llm: {
@@ -32,7 +36,8 @@ export const config = {
   },
 
   embeddings: {
-    provider: (process.env.EMBEDDING_PROVIDER ?? "openai") as EmbeddingProvider,
+    /** none = no vector search; retrieval is keyword search + a Haiku router over the article catalogue (Anthropic key only). */
+    provider: (process.env.EMBEDDING_PROVIDER ?? "none") as EmbeddingProvider,
     model: process.env.EMBEDDING_MODEL ?? "text-embedding-3-large",
     dimensions: envInt("EMBEDDING_DIMENSIONS", 1536),
   },
@@ -42,6 +47,8 @@ export const config = {
     questionMaxChars: envInt("QUESTION_MAX_CHARS", 1000),
     retrievalMinScore: envFloat("RETRIEVAL_MIN_SCORE", 0.3),
     answerTopArticles: envInt("ANSWER_TOP_ARTICLES", 4),
+    /** EMBEDDING_PROVIDER=none: the router sees the whole catalogue when the KB has at most this many articles, otherwise only keyword candidates. */
+    routerCatalogueMax: envInt("ROUTER_CATALOGUE_MAX", 300),
     historyMaxMessages: envInt("HISTORY_MAX_MESSAGES", 6),
   },
 

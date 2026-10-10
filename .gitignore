@@ -8,10 +8,10 @@ out
 next-env.d.ts
 .DS_Store
 
-# Raw Salesforce exports, PDF printouts and generated canonical data stay out of git (internal Mio content).
+# Source material stays out of git (internal Mio content). data/canonical and data/index ARE committed:
+# with STORE=file the app needs them at runtime, so the repo must be private.
 data/pdf/*
 !data/pdf/.gitkeep
 data/raw/*
 !data/raw/.gitkeep
-data/canonical/*
-!data/canonical/.gitkeep
+data/logs/

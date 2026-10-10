@@ -68,8 +68,14 @@ class FakeEmbeddings implements EmbeddingClient {
   }
 }
 
+/** False when EMBEDDING_PROVIDER=none: no vectors anywhere; retrieval is keyword search + Haiku router. */
+export function embeddingsEnabled(): boolean {
+  return config.embeddings.provider !== "none";
+}
+
 let singleton: EmbeddingClient | undefined;
 export function getEmbeddingClient(): EmbeddingClient {
+  if (!embeddingsEnabled()) throw new Error("Embeddings are disabled (EMBEDDING_PROVIDER=none)");
   if (!singleton) {
     singleton = (config.embeddings.provider as string) === "fake" ? new FakeEmbeddings() : new OpenAICompatibleEmbeddings();
   }

@@ -1,9 +1,9 @@
 import { config } from "./config";
-import { cacheLookup, cacheStore, gate1, gate2, gate3, normalizeQuestion } from "./gates";
+import { cacheLookup, cacheStore, gate1, gate2, gate3, normalizeQuestion, verdictToOutcome } from "./gates";
 import { getLlm, type ChatMessage } from "./llm";
 import { logQuery } from "./log";
 import { answerSystemPrompt, articlesContext } from "./prompts";
-import { listCategories, retrieveArticles, type RetrievedArticle } from "./retrieval";
+import { listCategories, retrieveArticles, type RetrievalResult, type RetrievedArticle } from "./retrieval";
 
 /** Events streamed to the client as newline-delimited JSON. */
 export type ChatEvent =
@@ -19,7 +19,7 @@ export interface AnswerInput {
 }
 
 function toSources(articles: RetrievedArticle[]) {
-  return articles.map((a) => ({ id: a.id, articleNumber: a.articleNumber, title: a.title, sourceUrl: a.sourceUrl }));
+  return articles.map((a) => ({ id: a.id, articleNumber: a.articleNumber ?? null, title: a.title, sourceUrl: a.sourceUrl ?? null }));
 }
 
 /**
@@ -63,9 +63,18 @@ export async function* answerQuestion(input: AnswerInput): AsyncGenerator<ChatEv
   // Retrieval. For follow-ups, embed the previous user turn too so "og hva med refusjon?" still finds the topic.
   const prevUser = [...history.slice(0, -1)].reverse().find((m) => m.role === "user");
   const retrievalQuery = !isFirstTurn && prevUser ? `${prevUser.content}\n${question}` : question;
-  const articles = await retrieveArticles(retrievalQuery);
+  let articles: RetrievedArticle[];
+  let router: RetrievalResult["router"];
+  try {
+    ({ articles, router } = await retrieveArticles(retrievalQuery));
+  } catch (err) {
+    console.error("retrieval failed", err);
+    logQuery({ ...base, gate: "error", latencyMs: Date.now() - started });
+    yield { type: "error", message: "Klarte ikke å søke i kunnskapsbasen akkurat nå. Prøv igjen om litt." };
+    return;
+  }
 
-  // Gate 2 — retrieval score
+  // Gate 2 — retrieval score (router mode: did the router pick anything at all?)
   const g2 = gate2(articles);
   if (g2.kind === "reject") {
     logQuery({ ...base, gate: g2.gate, bestScore: g2.bestScore, articleIds: articles.map((a) => a.id), latencyMs: Date.now() - started });
@@ -75,11 +84,13 @@ export async function* answerQuestion(input: AnswerInput): AsyncGenerator<ChatEv
     return;
   }
 
-  // Gate 3 — cheap classifier
+  // Gate 3 — cheap classifier (already answered by the router when embeddings are off)
   const categories = await listCategories();
   let g3: Awaited<ReturnType<typeof gate3>>;
   try {
-    g3 = await gate3(question, articles, categories);
+    g3 = router
+      ? { outcome: verdictToOutcome(router.verdict, router.clarifyingQuestion), usage: router.usage }
+      : await gate3(question, articles, categories);
   } catch (err) {
     console.error("classifier failed", err);
     logQuery({ ...base, gate: "error", bestScore: g2.bestScore, articleIds: articles.map((a) => a.id), latencyMs: Date.now() - started });

@@ -2,26 +2,40 @@
 
 Intern chat-assistent som svarer på spørsmål fra administrasjonen **utelukkende** basert på artiklene i Mios Salesforce Knowledge-base.
 
-- **Prototype:** Next.js på Vercel · Postgres + pgvector (Neon) · Claude Opus 5.5 via Anthropic API · OpenAI-embeddings
-- **Produksjon (mål):** Samme kode på Azure · Azure Database for PostgreSQL (pgvector) · Claude via Microsoft Foundry *eller* Azure OpenAI · Azure OpenAI-embeddings (EU-region) · Entra ID
+- **Prototype:** Next.js på Vercel · **filbasert indeks** (`data/index/index.json`, ingen database) · Claude Opus 5.5 + Haiku 5.5 via Anthropic API · **ingen embeddings** (kun én nøkkel)
+- **Produksjon (mål):** Samme kode på Azure · **Postgres + pgvector** (Azure Database for PostgreSQL) · Claude via Microsoft Foundry *eller* Azure OpenAI · Azure OpenAI-embeddings (EU-region) · Entra ID
 
-Alt som skal byttes mellom prototype og produksjon er miljøvariabler, ikke kode.
+Alt som skal byttes mellom prototype og produksjon er miljøvariabler, ikke kode. `STORE=file` → `STORE=postgres` er det eneste bytte som også krever et nytt kjøreskript (`kb:ingest` i stedet for `kb:index`).
 
 ---
 
 ## Arkitektur
 
 ```
-Salesforce Knowledge ──export/REST──▶ data/raw ──normalize──▶ data/canonical/articles.jsonl
-                                                                      │
-                                                                   ingest  (chunk → embed → upsert)
-                                                                      ▼
-                                                       Postgres: articles, chunks(embedding, tsv)
-                                                                      ▲
+PDF-utskrifter / Salesforce-eksport / REST ──▶ data/raw ──normalize──▶ data/canonical/articles.jsonl
+                                                                               │
+                                        STORE=file:  kb:index ──▶ data/index/index.json (lastes i minnet)
+                                        STORE=postgres: kb:ingest ──▶ Postgres: articles, chunks(embedding, tsv)
+                                                                               ▲
 Bruker ──▶ Chat UI ──▶ POST /api/chat ──▶ gate 1 ──▶ retrieval (hybrid) ──▶ gate 2 ──▶ gate 3 (Haiku) ──▶ gate 4 (Opus) ──▶ stream
                                               │                                                                      │
                                               └──────────────────────── query_log ◀──────────────────────────────────┘
 ```
+
+### Lagring: fil nå, Postgres ved live
+
+`src/lib/store/` er det eneste stedet som vet hvor dataene ligger. `STORE` i `.env` velger backend:
+
+| | `STORE=file` (prototype) | `STORE=postgres` (live) |
+|---|---|---|
+| Kunnskapsbase | `data/index/index.json` – chunks + embeddings, bygget av `npm run kb:index`, lastet i minnet ved oppstart | `articles` + `chunks` i Postgres/pgvector, fylt av `npm run kb:ingest` |
+| Vektorsøk | cosine i minnet | pgvector HNSW |
+| Nøkkelordsøk | innebygd BM25 | `tsvector('norwegian')` |
+| `query_log` | stdout (Vercel-loggen) + `data/logs/query_log.jsonl` lokalt | tabell `query_log` |
+| Svar-cache | i minnet per instans (nullstilles ved cold start) | tabell `answer_cache` |
+| Passer til | de ~11–200 første dokumentene | hele kunnskapsbasen (4 000 artikler ≈ 250 MB vektorer – for mye for en JSON-fil) |
+
+**Ved live:** sett `STORE=postgres` og `DATABASE_URL`, kjør `npm run db:migrate && npm run kb:ingest`. Ingen kodeendring. Merk at med `STORE=file` må `data/canonical/` og `data/index/` ligge i repoet (appen trenger dem ved kjøretid), så repoet må være privat – det er Mios interne innhold.
 
 ### Kanonisk artikkelformat
 
@@ -49,14 +63,24 @@ Utskriftene fra Salesforce (`Kvalitetsdokument_Utskrift?id=ka0…`) konverteres 
 ```bash
 pip install pymupdf
 python3 scripts/pdf_to_canonical.py data/pdf/*.pdf -o data/raw/kvalitetsdokumenter.json
-npm run kb:normalize && npm run kb:ingest
+npm run kb:build                  # (STORE=postgres: npm run kb:normalize && npm run kb:ingest)
 ```
 
 De 11 første dokumentene ligger i `data/pdf/` og er ferdig konvertert i `data/raw/kvalitetsdokumenter.json` (begge er gitignorert – internt Mio-innhold). Bilder i dokumentene (skjermbilder, ikoner) tas ikke med.
 
 ### Retrieval
 
-Artikler deles i ~600-token-biter (med tittel + kategorier som prefiks) og embeddes med `text-embedding-3-large` (1536 dimensjoner). Søk er hybrid: pgvector cosine + Postgres fulltekst (`norwegian`), slått sammen med reciprocal rank fusion og gruppert per artikkel. De `ANSWER_TOP_ARTICLES` beste **hele** artiklene sendes til modellen.
+Artikler deles i ~600-token-biter (med tittel + kategorier som prefiks). `EMBEDDING_PROVIDER` velger søkemetode:
+
+| | `none` (prototype) | `openai` / `azure-openai` |
+|---|---|---|
+| Nøkler | kun `ANTHROPIC_API_KEY` | + OpenAI/Azure OpenAI |
+| Søk | BM25-nøkkelordsøk gir kandidater, så leser **Haiku 5.5 katalogen** (tittel, sammendrag, kategorier for alle artikler – cachet systemprompt) og velger inntil 4 artikler | hybrid: vektor (cosine) + nøkkelord, reciprocal rank fusion |
+| Gate 3 | ruteren gir scope-vurderingen i samme kall – ingen ekstra Haiku-kall | eget Haiku-kall |
+| Pris | ett Haiku-kall per spørsmål (katalogen er cachet, ~10 % pris) – også for spørsmål som er helt utenfor tema | embedding-kall + Haiku kun ved treff |
+| Passer til | opp til noen hundre artikler (over `ROUTER_CATALOGUE_MAX=300` ser ruteren bare nøkkelordkandidatene) | hele kunnskapsbasen |
+
+Ved live (4 000 artikler, `STORE=postgres`) byttes til `azure-openai`-embeddings – pgvector krever vektorer. De `ANSWER_TOP_ARTICLES` beste **hele** artiklene sendes til modellen i begge moduser.
 
 ### Blockers (gates) – billigst først
 
@@ -64,8 +88,8 @@ Artikler deles i ~600-token-biter (med tittel + kategorier som prefiks) og embed
 |---|---|---|
 | 0 | Innlogging (Entra ID) + rate limiting | **Hoppet over i prototypen** |
 | 1 | Min/maks lengde, normalisering, eksakt-gjentak-cache (`answer_cache`) | Gratis |
-| 2 | Beste cosine-score < `RETRIEVAL_MIN_SCORE` → avvis uten LLM-kall | Ett embedding-kall |
-| 3 | Haiku 5.5-klassifisering: `in_scope` / `out_of_scope` / `clarify`, med kategoritreet som scope-definisjon | ~300 cachede tokens |
+| 2 | Ingen artikkel funnet (ruter valgte ingen / beste cosine-score < `RETRIEVAL_MIN_SCORE`) → avvis | Ruter-kall / ett embedding-kall |
+| 3 | Haiku 5.5-klassifisering: `in_scope` / `out_of_scope` / `clarify`, med kategoritreet som scope-definisjon (inkludert i ruter-kallet når embeddings er av) | ~300 cachede tokens |
 | 4 | Streng, cachet systemprompt («svar kun fra vedlagte artikler, oppgi kilder»), `ANSWER_MAX_TOKENS`, kun siste `HISTORY_MAX_MESSAGES` meldinger | Det eneste dyre kallet |
 
 Alle avgjørelser logges i `query_log` med spørsmål, gate, beste score, artikkel-ID-er og tokenbruk. Bruk den til å justere `RETRIEVAL_MIN_SCORE` og til å finne hull i kunnskapsbasen (`WHERE gate = 'gate2_no_match'`).
@@ -76,17 +100,15 @@ Alle avgjørelser logges i `query_log` med spørsmål, gate, beste score, artikk
 
 ```bash
 npm install
-cp .env.example .env.local        # fyll inn DATABASE_URL, ANTHROPIC_API_KEY, OPENAI_API_KEY
-npm run db:migrate                # oppretter pgvector-extension og tabeller
+cp .env.example .env.local        # fyll inn ANTHROPIC_API_KEY (STORE=file og EMBEDDING_PROVIDER=none er standard)
 
-# Prøv med de innebygde eksempelartiklene:
-npm run kb:normalize -- data/sample
-npm run kb:ingest
-
+npm run kb:build                  # data/raw/*.json → data/canonical/articles.jsonl → data/index/index.json
 npm run dev                       # http://localhost:3000
 ```
 
-Uten API-nøkler kan hele pipelinen likevel kjøres lokalt med `EMBEDDING_PROVIDER=fake` (deterministiske hash-embeddings). Sett da `RETRIEVAL_MIN_SCORE=0` – de falske vektorene gir lave scorer. Gate 3 og 4 krever ekte nøkkel.
+`data/raw/kvalitetsdokumenter.json` (de 11 konverterte dokumentene) ligger allerede klar, og `data/index/index.json` er ferdig bygget for `EMBEDDING_PROVIDER=none`, så det eneste som mangler er nøkkelen. Eksempeldata i Salesforce-CSV-form: `npm run kb:normalize -- data/sample && npm run kb:index`.
+
+Vil du ha vektorsøk i prototypen: sett `EMBEDDING_PROVIDER=openai` + `OPENAI_API_KEY` og kjør `kb:index` på nytt (uendrede artikler gjenbrukes ved senere kjøringer). `EMBEDDING_PROVIDER=fake` gir deterministiske hash-vektorer for lokal testing uten nøkler (sett da `RETRIEVAL_MIN_SCORE=0.2`).
 
 ### Ekte Salesforce-eksport
 
@@ -100,13 +122,13 @@ Uten API-nøkler kan hele pipelinen likevel kjøres lokalt med `EMBEDDING_PROVID
    og eventuelt `SELECT ParentId, DataCategoryGroupName, DataCategoryName FROM Knowledge__DataCategorySelection`.
 2. Legg CSV/JSON-filene i `data/raw/` (filnavnet for kategorier må inneholde «DataCategory»).
 3. Oppdater `src/lib/salesforce/field-mapping.ts` hvis feltnavnene avviker.
-4. `npm run kb:normalize && npm run kb:ingest` – ingest er idempotent (uendrede artikler hoppes over, fjernede slettes).
+4. `npm run kb:build` (fil) eller `npm run kb:normalize && npm run kb:ingest` (Postgres) – begge er idempotente (uendrede artikler hoppes over, fjernede slettes).
 
 **API-drevet (senere):** `npm run kb:fetch-salesforce` henter det samme via REST med `SF_INSTANCE_URL` + `SF_ACCESS_TOKEN`. I Azure blir dette en timer-trigget Function med `WHERE LastPublishedDate > :sist` for inkrementell synk.
 
-### Postgres-hosting
+### Postgres-hosting (fra `STORE=postgres`)
 
-**Prototype (Vercel):** Supabase eller Neon – begge har pgvector, EU-regioner og gratisnivå som holder til 4 000 artikler (~120 MB vektorer + indeks; 500 MB-grensen er nær, men ikke overskredet). Opprett prosjektet i **Frankfurt (eu-central-1)** slik at innholdet blir i EU også under prototypen. Aktiver `vector`-extension (Supabase: Database → Extensions; `db:migrate` gjør det også). Bruk den **poolede** tilkoblingsstrengen i `DATABASE_URL` på Vercel (Supabase Supavisor port 6543 i transaction mode / Neon `-pooler`-host) – serverless-funksjoner åpner og lukker tilkoblinger hele tiden. Lokal `kb:ingest` kan bruke direkte tilkobling. Neon vinner bare hvis du vil ha Vercel Marketplace-integrasjonen (automatisk `DATABASE_URL`, database-branch per preview).
+**Hostet prototype (Vercel):** Supabase eller Neon – begge har pgvector, EU-regioner og gratisnivå som holder til 4 000 artikler (~120 MB vektorer + indeks; 500 MB-grensen er nær, men ikke overskredet). Opprett prosjektet i **Frankfurt (eu-central-1)** slik at innholdet blir i EU også under prototypen. Aktiver `vector`-extension (Supabase: Database → Extensions; `db:migrate` gjør det også). Bruk den **poolede** tilkoblingsstrengen i `DATABASE_URL` på Vercel (Supabase Supavisor port 6543 i transaction mode / Neon `-pooler`-host) – serverless-funksjoner åpner og lukker tilkoblinger hele tiden. Lokal `kb:ingest` kan bruke direkte tilkobling. Neon vinner bare hvis du vil ha Vercel Marketplace-integrasjonen (automatisk `DATABASE_URL`, database-branch per preview).
 
 **Produksjon (Azure):** **Azure Database for PostgreSQL Flexible Server** i Norway East (eller Sweden Central hvis Mios øvrige ressurser står der).
 - Legg `vector` til i serverparameteren `azure.extensions` *før* `db:migrate`, ellers nektes `CREATE EXTENSION`.
@@ -118,10 +140,11 @@ Uten API-nøkler kan hele pipelinen likevel kjøres lokalt med `EMBEDDING_PROVID
 
 ### Deploy til Vercel
 
-1. Opprett Supabase/Neon-database i Frankfurt (se over), kjør `npm run db:migrate` mot den.
-2. Sett miljøvariablene fra `.env.example` i Vercel.
-3. Kjør `kb:normalize` + `kb:ingest` lokalt mot databasen (embeddings genereres én gang).
-4. `vercel deploy`.
+1. `npm run kb:build` lokalt og commit `data/canonical/` + `data/index/` (privat repo).
+2. Sett miljøvariablene fra `.env.example` i Vercel (`STORE=file`, nøkler, modeller).
+3. `vercel deploy`. `next.config.ts` sørger for at `data/index/` følger med serverless-funksjonen.
+
+Ny versjon av kunnskapsbasen = kjør `kb:build` på nytt og deploy.
 
 ---
 
@@ -141,7 +164,7 @@ Prototypen kjører **Claude Opus 5.5** (`ANSWER_MODEL`) med `ANSWER_EFFORT=low` 
 | `foundry` | `@anthropic-ai/foundry-sdk` (`AnthropicFoundry`) | Samme Messages API. Foundry støtter **ikke** Batches, Files API, Skills eller server-side web-verktøy – vi bruker ingen av dem. |
 | `azure-openai` | `openai` (`AzureOpenAI`, Responses API) | Fallback med garantert EU-inferens |
 
-`EMBEDDING_PROVIDER=openai` → `azure-openai` bytter til Azure OpenAI-deployment av **samme modell**, så indeksen bygget i prototypen kan gjenbrukes uten re-embedding. `EMBEDDING_DIMENSIONS` må aldri endres etter ingest.
+`EMBEDDING_PROVIDER`: `none` (prototype, kun Anthropic) → `azure-openai` ved live. Har man brukt `openai` i prototypen, er Azure OpenAI-deployment av **samme modell** vektor-kompatibel, så indeksen kan gjenbrukes uten re-embedding. `EMBEDDING_DIMENSIONS` må aldri endres etter ingest.
 
 ## ⚠️ EU-dataresidens – må avklares med Mio
 
@@ -159,9 +182,9 @@ Kilder: [InfoQ](https://www.infoq.com/news/2026/07/claude-foundry-ga-europe/), [
 | Prototype | Produksjon |
 |---|---|
 | Vercel | Azure App Service / Container Apps (samme Next.js-build) |
-| Supabase/Neon (Frankfurt) | Azure Database for PostgreSQL Flexible Server (Norway East) med `vector`-extension – samme `db/schema.sql` |
+| `STORE=file` (index.json i minnet) | `STORE=postgres` → Azure Database for PostgreSQL Flexible Server (Norway East) med `vector`-extension – `db/schema.sql` |
 | Anthropic API | Foundry (`LLM_PROVIDER=foundry`) eller Azure OpenAI |
-| OpenAI-embeddings | Azure OpenAI-embeddings i EU-region, samme modell |
+| Ingen embeddings (Haiku-ruter) | Azure OpenAI-embeddings i EU-region (`EMBEDDING_PROVIDER=azure-openai`) – pgvector krever vektorer |
 | Fil-eksport fra Salesforce | Azure Function (timer) → Salesforce REST → ingest |
 | Ingen innlogging | Entra ID (gate 0) + rate limiting; `user_id` i `query_log` er klar |
 
@@ -170,16 +193,18 @@ Hvis Mios team foretrekker **Azure AI Search** fremfor pgvector, er `src/lib/ret
 ## Struktur
 
 ```
-db/schema.sql                      tabeller + indekser (pgvector, tsvector, query_log, answer_cache)
+db/schema.sql                      Postgres-skjema (STORE=postgres): pgvector, tsvector, query_log, answer_cache
 data/sample/                       Salesforce-formet eksempeleksport (CSV)
 data/pdf/ · data/raw/              Mios PDF-utskrifter og konvertert JSON (gitignorert)
-scripts/                           migrate · normalize · ingest · fetch-salesforce · pdf_to_canonical.py
+data/canonical/ · data/index/      normalisert jsonl og ferdig indeks med embeddings (committes, privat repo)
+scripts/                           normalize · index (fil) · migrate + ingest (Postgres) · fetch-salesforce · pdf_to_canonical.py
+src/lib/store/                     file-store (prototype) · pg-store (live) bak ett grensesnitt
 src/lib/schema.ts                  kanonisk Article (zod)
 src/lib/salesforce/                field-mapping · normalize (HTML → Markdown, kategorier)
 src/lib/chunk.ts                   chunking
-src/lib/embeddings/                OpenAI / Azure OpenAI / fake
+src/lib/embeddings/                none / OpenAI / Azure OpenAI / fake
 src/lib/llm/                       Anthropic / Foundry / Azure OpenAI bak ett grensesnitt
-src/lib/retrieval.ts               hybrid søk + RRF
+src/lib/retrieval.ts               hybrid søk + RRF, eller BM25 + Haiku-ruter når embeddings er av
 src/lib/gates.ts                   gate 1–3
 src/lib/prompts.ts                 gate 4 (systemprompt + artikkelkontekst)
 src/lib/answer.ts                  orkestrering + logging
